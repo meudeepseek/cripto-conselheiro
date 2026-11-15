@@ -4,6 +4,7 @@ import json
 import math
 import logging
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Tuple, Optional
 
 import pandas as pd
@@ -35,7 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY]):
-    raise ValueError("ERRO CRÍTICO: Verifique TELEGRAM_TOKEN, TELEGRAM_CHAT_ID e GEMINI_API_KEY no .env")
+    raise ValueError("ERRO CRÍTICO: Verifique TELEGRAM_TOKEN, TELEGRAM_CHAT_ID e GEMINI_API_KEY no .env ou painel.")
 
 try:
     BANCA_TOTAL = float(os.getenv("BANCA_TOTAL", "1000"))
@@ -43,7 +44,7 @@ try:
     if BANCA_TOTAL <= 0 or not (0.001 <= RISCO_POR_OPERACAO <= 0.10):
         raise ValueError("BANCA_TOTAL deve ser > 0 e RISCO_POR_OPERACAO entre 0.001 (0.1%) e 0.10 (10%).")
 except ValueError as e:
-    raise ValueError(f"ERRO DE CONFIGURAÇÃO NO .ENV: {e}")
+    raise ValueError(f"ERRO DE CONFIGURAÇÃO DE RISCO: {e}")
 
 # ==============================================================================
 # 2. PARÂMETROS DA ESTRATÉGIA
@@ -52,15 +53,16 @@ PARES = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "LINK/USDT"]
 TIMEFRAME = "1h"
 RSI_LIMITE_COMPRA = 30.0
 MULTIPLICADOR_ATR = 1.5
-MAX_STOP_PERCENT = 0.045       # Teto máximo de 4.5% de Stop Loss
-MIN_STOP_PERCENT = 0.004       # Piso mínimo de 0.4% (evita divisão por números minúsculos)
-RELACAO_RISCO_RETORNO = 2.0    # Alvo sempre 2x o tamanho do Stop (1:2)
+MAX_STOP_PERCENT = 0.045        # Teto máximo de 4.5% de Stop Loss
+MIN_STOP_PERCENT = 0.004        # Piso mínimo de 0.4%
+RELACAO_RISCO_RETORNO = 2.0     # Alvo sempre 2x o tamanho do Stop (1:2)
 COOLDOWN_ALERTA_SEGUNDOS = 14400  # 4 horas sem repetir alerta da mesma moeda
 
 FEEDS_RSS = [
     "https://cointelegraph.com/rss",
     "https://www.coindesk.com/arc/outboundfeeds/rss/"
 ]
+
 
 # ==============================================================================
 # 3. SESSÃO HTTP BLINDADA (RETENTATIVAS AUTOMÁTICAS) E CLIENTE IA
@@ -76,8 +78,9 @@ def criar_sessao_http() -> requests.Session:
     adaptador = HTTPAdapter(max_retries=estrategia_retry)
     sessao.mount("https://", adaptador)
     sessao.mount("http://", adaptador)
-    sessao.headers.update({"User-Agent": "BotConselheiroCripto/3.0"})
+    sessao.headers.update({"User-Agent": "BotConselheiroCripto/3.1"})
     return sessao
+
 
 http_session = criar_sessao_http()
 ai_client = genai.Client(
@@ -90,7 +93,29 @@ trava_memoria = threading.Lock()
 
 
 # ==============================================================================
-# 4. SCHEMA ESTRITO PARA A IA (CONTRA ALUCINAÇÃO)
+# 4. SERVIDOR HEALTH-CHECK PARA NUVEM GRATUITA (RENDER + UPTIMEROBOT)
+# ==============================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Bot Conselheiro v3 Online")
+
+    def log_message(self, format, *args):
+        # Silencia logs repetitivos de ping do UptimeRobot no console
+        return
+
+
+def iniciar_servidor_healthcheck() -> None:
+    porta = int(os.getenv("PORT", "10000"))
+    servidor = HTTPServer(("0.0.0.0", porta), HealthCheckHandler)
+    logging.info(f"Servidor Health-Check ativo na porta {porta}")
+    servidor.serve_forever()
+
+
+# ==============================================================================
+# 5. SCHEMA ESTRITO PARA A IA (CONTRA ALUCINAÇÃO)
 # ==============================================================================
 class AnaliseRiscoIA(BaseModel):
     vetar_operacao: bool = Field(
@@ -105,7 +130,7 @@ class AnaliseRiscoIA(BaseModel):
 
 
 # ==============================================================================
-# 5. COLETA DE DADOS (BINANCE, RSS E FEAR & GREED)
+# 6. COLETA DE DADOS (BINANCE, RSS E FEAR & GREED)
 # ==============================================================================
 def buscar_velas_binance(par: str, intervalo: str = "1h", limite: int = 100) -> list:
     simbolo = par.replace("/", "").upper()
@@ -152,7 +177,6 @@ def coletar_manchetes(limite_por_feed: int = 8) -> List[str]:
 
 
 def obter_modelos_ativos() -> List[str]:
-    """Consulta a API do Google e retorna os modelos Gemini ativos que suportam geração de texto."""
     candidatos = [
         "gemini-3-flash-preview",
         "gemini-3.1-flash-lite-preview",
@@ -220,151 +244,10 @@ def consultar_ia_veto(par: str, preco: float, rsi: float) -> Tuple[bool, str, st
 
     logging.error(f"Todos os modelos de IA falharam. Último erro: {ultimo_erro}")
     return False, "IA OFFLINE", "Erro temporário na IA. Valide notícias manualmente antes de operar."
-    manchetes = coletar_manchetes()
-    if not manchetes:
-        return False, "RSS OFFLINE", "Não foi possível carregar notícias. Valide manualmente antes de entrar."
-
-    texto_manchetes = "\n".join(manchetes[:16])
-    prompt = f"""
-    Você é um analista de risco quantitativo de criptomoedas.
-    O sistema técnico detectou uma possível compra para {par} (Preço: ${preco:.4f}, RSI: {rsi:.1f}).
-    Verifique nas manchetes abaixo se há algum evento catastrófico (hack, golpe, falência, processo regulatório grave) acontecendo AGORA que justifique VETAR a compra.
-    Quedas normais de mercado sem notícia grave NÃO devem ser vetadas.
-
-    Manchetes recentes:
-    {texto_manchetes}
-    """
-
-    modelos_candidatos = [
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-3.1-pro-preview",
-    ]
-    ultimo_erro = ""
-
-    for modelo in modelos_candidatos:
-        try:
-            response = ai_client.models.generate_content(
-                model=modelo,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AnaliseRiscoIA,
-                    temperature=0.1,
-                ),
-            )
-            if not response or not response.text:
-                raise ValueError("Resposta vazia da API.")
-
-            resultado = json.loads(response.text)
-            nivel = str(resultado.get("nivel_risco", "MEDIO")).upper()
-            if nivel not in ("BAIXO", "MEDIO", "ALTO"):
-                nivel = "MEDIO"
-
-            return (
-                bool(resultado.get("vetar_operacao", False)),
-                nivel,
-                str(resultado.get("resumo_noticias", "Sem resumo disponível."))
-            )
-        except Exception as e:
-            ultimo_erro = str(e)
-            logging.warning(f"Falha no modelo {modelo}: {e}")
-
-    logging.error(f"Todos os modelos de IA falharam. Último erro: {ultimo_erro}")
-    return False, "IA OFFLINE", "Erro temporário na IA. Valide notícias manualmente antes de operar."
-    manchetes = coletar_manchetes()
-    if not manchetes:
-        return False, "RSS OFFLINE", "Não foi possível carregar notícias. Valide manualmente antes de entrar."
-
-    texto_manchetes = "\n".join(manchetes[:16])
-    prompt = f"""
-    Você é um analista de risco quantitativo de criptomoedas.
-    O sistema técnico detectou uma possível compra para {par} (Preço: ${preco:.4f}, RSI: {rsi:.1f}).
-    Verifique nas manchetes abaixo se há algum evento catastrófico (hack, golpe, falência, processo regulatório grave) acontecendo AGORA que justifique VETAR a compra.
-    Quedas normais de mercado sem notícia grave NÃO devem ser vetadas.
-
-    Manchetes recentes:
-    {texto_manchetes}
-    """
-
-    modelos_disponiveis = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-    ultimo_erro = ""
-
-    for modelo in modelos_disponiveis:
-        try:
-            response = ai_client.models.generate_content(
-                model=modelo,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=AnaliseRiscoIA,
-                    temperature=0.1,
-                ),
-            )
-            if not response or not response.text:
-                raise ValueError("Resposta vazia da API.")
-
-            resultado = json.loads(response.text)
-            nivel = str(resultado.get("nivel_risco", "MEDIO")).upper()
-            if nivel not in ("BAIXO", "MEDIO", "ALTO"):
-                nivel = "MEDIO"
-
-            return (
-                bool(resultado.get("vetar_operacao", False)),
-                nivel,
-                str(resultado.get("resumo_noticias", "Sem resumo disponível."))
-            )
-        except Exception as e:
-            ultimo_erro = str(e)
-            logging.warning(f"Falha no modelo {modelo}: {e}")
-
-    logging.error(f"Todos os modelos de IA falharam. Último erro: {ultimo_erro}")
-    return False, "IA OFFLINE", "Erro temporário na IA. Valide notícias manualmente antes de operar."
-    manchetes = coletar_manchetes()
-    if not manchetes:
-        return False, "RSS OFFLINE", "Não foi possível carregar notícias. Valide manualmente antes de entrar."
-
-    texto_manchetes = "\n".join(manchetes[:16])
-    prompt = f"""
-    Você é um analista de risco quantitativo de criptomoedas.
-    O sistema técnico detectou uma possível compra para {par} (Preço: ${preco:.4f}, RSI: {rsi:.1f}).
-    Verifique nas manchetes abaixo se há algum evento catastrófico (hack, golpe, falência, processo regulatório grave) acontecendo AGORA que justifique VETAR a compra.
-    Quedas normais de mercado sem notícia grave NÃO devem ser vetadas.
-
-    Manchetes recentes:
-    {texto_manchetes}
-    """
-
-    try:
-        response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=AnaliseRiscoIA,
-                temperature=0.1,
-            ),
-        )
-        if not response or not response.text:
-            raise ValueError("Resposta vazia da API do Gemini.")
-
-        resultado = json.loads(response.text)
-        nivel = str(resultado.get("nivel_risco", "MEDIO")).upper()
-        if nivel not in ("BAIXO", "MEDIO", "ALTO"):
-            nivel = "MEDIO"
-
-        return (
-            bool(resultado.get("vetar_operacao", False)),
-            nivel,
-            str(resultado.get("resumo_noticias", "Sem resumo disponível."))
-        )
-    except Exception as e:
-        logging.error(f"Falha na consulta à IA: {e}")
-        return False, "IA OFFLINE", "Erro temporário na IA. Valide notícias manualmente antes de operar."
 
 
 # ==============================================================================
-# 6. CÁLCULOS TÉCNICOS E GESTÃO DE RISCO
+# 7. CÁLCULOS TÉCNICOS E GESTÃO DE RISCO
 # ==============================================================================
 def calcular_indicadores(df: pd.DataFrame) -> pd.DataFrame:
     delta = df["close"].diff()
@@ -397,7 +280,7 @@ def calcular_tamanho_mao(stop_percentual: float) -> Tuple[float, float]:
 
 
 # ==============================================================================
-# 7. MOTOR DE ANÁLISE (AUTOMÁTICO E SOB DEMANDA)
+# 8. MOTOR DE ANÁLISE (AUTOMÁTICO E SOB DEMANDA)
 # ==============================================================================
 def analisar_par(par: str, forcar_relatorio: bool = False) -> Optional[str]:
     try:
@@ -412,7 +295,6 @@ def analisar_par(par: str, forcar_relatorio: bool = False) -> Optional[str]:
         volume_atual = float(vela_fechada["volume"])
         volume_medio = float(vela_fechada["vol_medio"])
 
-        # Validação rigorosa contra NaN / Infinito / Zero
         valores_criticos = [preco_atual, rsi, atr, volume_atual, volume_medio]
         if any(not math.isfinite(v) for v in valores_criticos) or preco_atual <= 0 or atr <= 0:
             logging.warning(f"[{par}] Valores matemáticos inválidos ignorados.")
@@ -430,7 +312,6 @@ def analisar_par(par: str, forcar_relatorio: bool = False) -> Optional[str]:
         alvo_percentual = stop_percentual * RELACAO_RISCO_RETORNO
         tamanho_mao, perda_maxima = calcular_tamanho_mao(stop_percentual)
 
-        # Modo Sob Demanda (/analisar)
         if forcar_relatorio:
             _, nivel_risco, resumo_ia = consultar_ia_veto(par, preco_atual, rsi)
             fng = buscar_fear_and_greed()
@@ -449,7 +330,6 @@ def analisar_par(par: str, forcar_relatorio: bool = False) -> Optional[str]:
                 f"• Take Profit: <code>${take_profit:.4f}</code> (+{alvo_percentual*100:.2f}%)"
             )
 
-        # Modo Automático
         if rsi < RSI_LIMITE_COMPRA and volume_atual > (volume_medio * 0.8):
             agora = time.time()
             with trava_memoria:
@@ -501,7 +381,7 @@ def analisar_par(par: str, forcar_relatorio: bool = False) -> Optional[str]:
 
 
 # ==============================================================================
-# 8. COMUNICAÇÃO E ESCUTA DE COMANDOS NO TELEGRAM
+# 9. COMUNICAÇÃO E ESCUTA DE COMANDOS NO TELEGRAM
 # ==============================================================================
 def enviar_telegram(mensagem: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -528,7 +408,6 @@ def escutar_comandos_telegram() -> None:
                 chat_id = str(msg.get("chat", {}).get("id", "")).strip()
                 texto = msg.get("text", "").strip()
 
-                # Bloqueio de segurança: só responde ao dono do TELEGRAM_CHAT_ID
                 if chat_id != TELEGRAM_CHAT_ID or not texto:
                     continue
 
@@ -567,12 +446,17 @@ def escutar_comandos_telegram() -> None:
 
 
 # ==============================================================================
-# 9. LOOP PRINCIPAL
+# 10. LOOP PRINCIPAL
 # ==============================================================================
 if __name__ == "__main__":
-    logging.info("Iniciando Bot Conselheiro v3 (Produção Blindada)...")
+    logging.info("Iniciando Bot Conselheiro v3.1 (Nuvem 24/7 Blindada)...")
+
+    # Sobe o Health-Check HTTP em background (necessário para Render Free)
+    thread_web = threading.Thread(target=iniciar_servidor_healthcheck, daemon=True)
+    thread_web.start()
+
     enviar_telegram(
-        "🤖 <b>Bot Conselheiro v3 Iniciado!</b>\n"
+        "🤖 <b>Bot Conselheiro v3 Online!</b>\n"
         "Comandos disponíveis:\n"
         "• <code>/status</code> — Verifica saúde do bot e humor do mercado\n"
         "• <code>/analisar BTC</code> — Faz raio-X imediato de qualquer moeda"

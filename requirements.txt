@@ -1,0 +1,6 @@
+pandas
+requests
+feedparser
+python-dotenv
+google-genai
+pydantic
