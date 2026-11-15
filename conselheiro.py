@@ -5,7 +5,6 @@ import logging
 from datetime import datetime
 from typing import List, Tuple
 
-import ccxt
 import pandas as pd
 import requests
 import feedparser
@@ -50,7 +49,7 @@ FEEDS_RSS = [
 ]
 
 # Inicialização dos Clientes
-exchange = ccxt.binance({"enableRateLimit": True, "timeout": 15000})
+
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 ultimo_alerta = {}
 
@@ -135,6 +134,34 @@ def consultar_ia_veto(par: str, preco: float, rsi: float) -> Tuple[bool, str, st
         # Fail-Safe: Não bloqueia o alerta técnico, mas avisa o humano que a IA falhou
         return False, "IA OFFLINE", "Erro ao consultar IA. Verifique notícias manualmente antes de operar."
 
+def buscar_velas_binance(par: str, intervalo: str = "1h", limite: int = 100) -> list:
+    """
+    Puxa velas (OHLCV) diretamente da API pública da Binance sem precisar do ccxt.
+    Formato de par na API REST: 'BTCUSDT' (sem a barra).
+    """
+    simbolo = par.replace("/", "")
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": simbolo,
+        "interval": intervalo,
+        "limit": limite
+    }
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    dados_brutos = resp.json()
+
+    # Converte o retorno da Binance para o mesmo formato [timestamp, open, high, low, close, volume]
+    velas = []
+    for v in dados_brutos:
+        velas.append([
+            int(v[0]),       # timestamp
+            float(v[1]),     # open
+            float(v[2]),     # high
+            float(v[3]),     # low
+            float(v[4]),     # close
+            float(v[5])      # volume
+        ])
+    return velas
 
 # ==============================================================================
 # 4. INDICADORES MATEMÁTICOS E TELEGRAM
@@ -180,7 +207,7 @@ def enviar_telegram(mensagem: str) -> None:
 # ==============================================================================
 def analisar_par(par: str) -> None:
     try:
-        velas = exchange.fetch_ohlcv(par, timeframe=TIMEFRAME, limit=100)
+        velas = buscar_velas_binance(par, intervalo=TIMEFRAME, limite=100)
         if not velas or len(velas) < 30:
             logging.warning(f"[{par}] Dados insuficientes retornados pela Binance.")
             return
@@ -246,7 +273,7 @@ def analisar_par(par: str) -> None:
             ultimo_alerta[par] = agora
             logging.info(f"[{par}] Alerta aprovado enviado com sucesso!")
 
-    except ccxt.NetworkError as e:
+    except requests.RequestException as e:
         logging.warning(f"[{par}] Erro de rede temporário na Binance: {e}")
     except Exception as e:
         logging.error(f"[{par}] Erro inesperado ao analisar par: {e}", exc_info=True)
